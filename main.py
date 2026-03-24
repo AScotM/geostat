@@ -12,7 +12,7 @@ class SimpleGeostat:
         if reset:
             self.data = []
         
-        with open(filename, 'r') as f:
+        with open(filename, 'r', encoding='utf-8', newline='') as f:
             reader = csv.reader(f)
             if has_header:
                 try:
@@ -30,7 +30,7 @@ class SimpleGeostat:
                     continue
     
     def save_csv(self, filename, predictions):
-        with open(filename, 'w', newline='') as f:
+        with open(filename, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['x', 'y', 'predicted'])
             for (x, y), pred in predictions:
@@ -59,11 +59,12 @@ class SimpleGeostat:
         distances = []
         for x, y, val in data_source:
             dist = math.hypot(x - target_x, y - target_y)
-            if dist > 0:
-                distances.append((dist, val))
+            if dist == 0:
+                return val
+            distances.append((dist, val))
         
         if max_points:
-            distances.sort(key=lambda x: x[0])
+            distances.sort(key=lambda item: item[0])
             distances = distances[:max_points]
         
         if not distances:
@@ -149,6 +150,8 @@ class SimpleGeostat:
         distances = []
         for x, y, val in self.data:
             dist = math.hypot(x - target_x, y - target_y)
+            if dist == 0:
+                return 0
             distances.append((dist, val, x, y))
         
         distances.sort(key=lambda x: x[0])
