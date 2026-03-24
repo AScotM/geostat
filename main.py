@@ -8,7 +8,10 @@ class SimpleGeostat:
     def __init__(self):
         self.data = []
     
-    def load_csv(self, filename, x_col=0, y_col=1, val_col=2, has_header=True):
+    def load_csv(self, filename, x_col=0, y_col=1, val_col=2, has_header=True, reset=False):
+        if reset:
+            self.data = []
+        
         with open(filename, 'r') as f:
             reader = csv.reader(f)
             if has_header:
@@ -34,6 +37,9 @@ class SimpleGeostat:
                 writer.writerow([x, y, pred])
     
     def create_grid(self, xmin, xmax, ymin, ymax, resolution):
+        if resolution <= 0:
+            raise ValueError("Resolution must be positive")
+        
         x_step = (xmax - xmin) / resolution
         y_step = (ymax - ymin) / resolution
         
@@ -75,6 +81,9 @@ class SimpleGeostat:
         return weighted_sum / total_weight
     
     def block_average(self, xmin, xmax, ymin, ymax, block_size=10):
+        if block_size <= 0:
+            raise ValueError("Block size must be positive")
+        
         blocks = defaultdict(list)
         
         for x, y, val in self.data:
@@ -92,6 +101,9 @@ class SimpleGeostat:
         return block_averages
     
     def experimental_variogram(self, max_lag, n_bins=20):
+        if max_lag <= 0 or n_bins <= 0:
+            return [], []
+        
         bin_width = max_lag / n_bins
         bins = [[] for _ in range(n_bins)]
         
@@ -117,7 +129,7 @@ class SimpleGeostat:
     
     def estimate_variogram_params(self, lags, gamma, model_type='spherical'):
         if not lags or not gamma:
-            return {'nugget': 0, 'sill': 1, 'range': 10}
+            return {'nugget': 0, 'sill': 1, 'range': 10, 'model': model_type}
         
         nugget = gamma[0] if gamma else 0
         sill = gamma[-1] - nugget if gamma[-1] > nugget else 1
@@ -127,6 +139,9 @@ class SimpleGeostat:
             if gamma[i] >= nugget + 0.95 * sill:
                 variogram_range = lags[i]
                 break
+        
+        if variogram_range <= 0:
+            variogram_range = lags[-1] if lags else 10
         
         return {'nugget': nugget, 'sill': sill, 'range': variogram_range, 'model': model_type}
     
@@ -205,6 +220,9 @@ class SimpleGeostat:
         if h <= 0:
             return 0
         
+        if r <= 0:
+            return nugget + sill
+        
         if model == 'spherical':
             if h < r:
                 return nugget + sill * (1.5 * h / r - 0.5 * (h / r) ** 3)
@@ -219,9 +237,13 @@ class SimpleGeostat:
                 return nugget + sill
     
     def cross_validate(self, power=2, k_folds=5):
+        if not self.data or k_folds <= 0:
+            return 0
+        
+        k_folds = min(k_folds, len(self.data))
         shuffled_data = self.data[:]
         random.shuffle(shuffled_data)
-        fold_size = len(shuffled_data) // k_folds
+        fold_size = max(1, len(shuffled_data) // k_folds)
         errors = []
         
         for fold in range(k_folds):
@@ -262,37 +284,28 @@ class SimpleGeostat:
             'y_range': (min(y_coords), max(y_coords))
         }
     
-    def predict_grid(self, xmin, xmax, ymin, ymax, resolution, method='idw', **kwargs):
+    def predict_grid_idw(self, xmin, xmax, ymin, ymax, resolution, power=2, max_points=None):
         grid = self.create_grid(xmin, xmax, ymin, ymax, resolution)
         predictions = []
         
-        block_averages = None
-        mean_value = None
+        for x, y in grid:
+            pred = self.idw(x, y, power=power, max_points=max_points)
+            predictions.append(((x, y), pred))
         
-        if method == 'block':
-            block_size = kwargs.get('block_size', 10)
-            block_averages = self.block_average(xmin, xmax, ymin, ymax, block_size)
-            mean_value = self.statistics_summary().get('mean', 0)
-        
-        stats_cache = self.statistics_summary()
+        return predictions
+    
+    def predict_grid_block(self, xmin, xmax, ymin, ymax, resolution, block_size=10):
+        grid = self.create_grid(xmin, xmax, ymin, ymax, resolution)
+        block_averages = self.block_average(xmin, xmax, ymin, ymax, block_size)
+        mean_value = self.statistics_summary().get('mean', 0)
+        predictions = []
         
         for x, y in grid:
-            if method == 'idw':
-                pred = self.idw(
-                    x, y,
-                    power=kwargs.get('power', 2),
-                    max_points=kwargs.get('max_points', None)
-                )
-            elif method == 'block':
-                block_size = kwargs.get('block_size', 10)
-                block_x = int((x - xmin) / block_size)
-                block_y = int((y - ymin) / block_size)
-                center_x = block_x * block_size + xmin + block_size / 2
-                center_y = block_y * block_size + ymin + block_size / 2
-                pred = block_averages.get((center_x, center_y), mean_value)
-            else:
-                pred = self.idw(x, y)
-            
+            block_x = int((x - xmin) / block_size)
+            block_y = int((y - ymin) / block_size)
+            center_x = block_x * block_size + xmin + block_size / 2
+            center_y = block_y * block_size + ymin + block_size / 2
+            pred = block_averages.get((center_x, center_y), mean_value)
             predictions.append(((x, y), pred))
         
         return predictions
@@ -320,10 +333,10 @@ if __name__ == "__main__":
     rmse = geo.cross_validate(power=2, k_folds=5)
     print(f"Cross-validation RMSE: {rmse:.4f}")
     
-    grid_predictions = geo.predict_grid(0, 100, 0, 100, 20, method='idw', power=2, max_points=10)
+    grid_predictions = geo.predict_grid_idw(0, 100, 0, 100, 20, power=2, max_points=10)
     geo.save_csv('predictions_full.csv', grid_predictions)
     
-    block_predictions = geo.predict_grid(0, 100, 0, 100, 10, method='block', block_size=10)
+    block_predictions = geo.predict_grid_block(0, 100, 0, 100, 10, block_size=10)
     geo.save_csv('block_predictions.csv', block_predictions)
     
     print(f"Grid predictions saved: {len(grid_predictions)} points")
