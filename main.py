@@ -2,15 +2,19 @@ import csv
 import math
 import random
 from collections import defaultdict
+from typing import List, Tuple, Dict, Optional
 
 class SimpleGeostat:
     
     def __init__(self):
         self.data = []
+        self.kdtree = None
     
-    def load_csv(self, filename, x_col=0, y_col=1, val_col=2, has_header=True, reset=False):
+    def load_csv(self, filename: str, x_col: int = 0, y_col: int = 1, 
+                 val_col: int = 2, has_header: bool = True, reset: bool = False) -> None:
         if reset:
             self.data = []
+            self.kdtree = None
         
         with open(filename, 'r', encoding='utf-8', newline='') as f:
             reader = csv.reader(f)
@@ -28,15 +32,30 @@ class SimpleGeostat:
                     self.data.append((x, y, val))
                 except (ValueError, IndexError):
                     continue
+        
+        self.build_spatial_index()
     
-    def save_csv(self, filename, predictions):
+    def build_spatial_index(self) -> None:
+        if self.data:
+            points = [(x, y) for x, y, _ in self.data]
+            self.kdtree = points
+    
+    def save_csv(self, filename: str, predictions: List[Tuple[Tuple[float, float], float]]) -> None:
         with open(filename, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['x', 'y', 'predicted'])
             for (x, y), pred in predictions:
                 writer.writerow([x, y, pred])
     
-    def create_grid(self, xmin, xmax, ymin, ymax, resolution):
+    def clear_data(self) -> None:
+        self.data = []
+        self.kdtree = None
+    
+    def create_grid(self, xmin: float, xmax: float, ymin: float, ymax: float, resolution: int) -> List[Tuple[float, float]]:
+        if xmin >= xmax:
+            raise ValueError("xmin must be less than xmax")
+        if ymin >= ymax:
+            raise ValueError("ymin must be less than ymax")
         if resolution <= 0:
             raise ValueError("Resolution must be positive")
         
@@ -52,7 +71,8 @@ class SimpleGeostat:
         
         return grid
     
-    def idw(self, target_x, target_y, power=2, max_points=None, data_source=None):
+    def idw(self, target_x: float, target_y: float, power: float = 2, 
+            max_points: Optional[int] = None, data_source: Optional[List[Tuple[float, float, float]]] = None) -> float:
         if data_source is None:
             data_source = self.data
         
@@ -81,16 +101,20 @@ class SimpleGeostat:
         
         return weighted_sum / total_weight
     
-    def block_average(self, xmin, xmax, ymin, ymax, block_size=10):
+    def block_average(self, xmin: float, xmax: float, ymin: float, ymax: float, block_size: float = 10) -> Dict[Tuple[float, float], float]:
         if block_size <= 0:
             raise ValueError("Block size must be positive")
+        if xmin >= xmax:
+            raise ValueError("xmin must be less than xmax")
+        if ymin >= ymax:
+            raise ValueError("ymin must be less than ymax")
         
         blocks = defaultdict(list)
         
         for x, y, val in self.data:
             if xmin <= x <= xmax and ymin <= y <= ymax:
-                block_x = int((x - xmin) / block_size)
-                block_y = int((y - ymin) / block_size)
+                block_x = int((x - xmin) // block_size)
+                block_y = int((y - ymin) // block_size)
                 blocks[(block_x, block_y)].append(val)
         
         block_averages = {}
@@ -101,8 +125,10 @@ class SimpleGeostat:
         
         return block_averages
     
-    def experimental_variogram(self, max_lag, n_bins=20):
-        if max_lag <= 0 or n_bins <= 0:
+    def experimental_variogram(self, max_lag: float, n_bins: int = 20) -> Tuple[List[float], List[float]]:
+        if max_lag <= 0:
+            return [], []
+        if n_bins <= 0:
             return [], []
         
         bin_width = max_lag / n_bins
@@ -128,25 +154,33 @@ class SimpleGeostat:
         
         return lag_centers, gamma
     
-    def estimate_variogram_params(self, lags, gamma, model_type='spherical'):
+    def estimate_variogram_params(self, lags: List[float], gamma: List[float], 
+                                   model_type: str = 'spherical', sill_fraction: float = 0.95) -> Dict[str, float]:
         if not lags or not gamma:
-            return {'nugget': 0, 'sill': 1, 'range': 10, 'model': model_type}
+            return {'nugget': 0, 'sill': 1, 'range': 10, 'model': 0}
         
         nugget = gamma[0] if gamma else 0
         sill = gamma[-1] - nugget if gamma[-1] > nugget else 1
-        variogram_range = lags[-1] * 0.7
+        variogram_range = lags[-1] * 0.7 if lags else 10
         
         for i in range(len(lags)):
-            if gamma[i] >= nugget + 0.95 * sill:
+            if gamma[i] >= nugget + sill_fraction * sill:
                 variogram_range = lags[i]
                 break
         
         if variogram_range <= 0:
             variogram_range = lags[-1] if lags else 10
         
-        return {'nugget': nugget, 'sill': sill, 'range': variogram_range, 'model': model_type}
+        model_code = 0
+        if model_type == 'spherical':
+            model_code = 1
+        elif model_type == 'exponential':
+            model_code = 2
+        
+        return {'nugget': nugget, 'sill': sill, 'range': variogram_range, 'model': model_code}
     
-    def approximate_kriging_variance(self, target_x, target_y, variogram_params, max_points=20):
+    def approximate_kriging_variance(self, target_x: float, target_y: float, 
+                                     variogram_params: Dict[str, float], max_points: int = 20) -> float:
         distances = []
         for x, y, val in self.data:
             dist = math.hypot(x - target_x, y - target_y)
@@ -185,7 +219,11 @@ class SimpleGeostat:
             n = n_neighbors + 1
             augmented = [A[i] + [b[i]] for i in range(n)]
             
+            regularization = 1e-10
             for col in range(n):
+                if col < n_neighbors:
+                    augmented[col][col] += regularization
+                
                 pivot = augmented[col][col]
                 if abs(pivot) < 1e-10:
                     continue
@@ -214,11 +252,11 @@ class SimpleGeostat:
         except Exception:
             return variogram_params['sill'] + variogram_params['nugget']
     
-    def _variogram_value(self, h, params):
+    def _variogram_value(self, h: float, params: Dict[str, float]) -> float:
         nugget = params['nugget']
         sill = params['sill']
         r = params['range']
-        model = params.get('model', 'spherical')
+        model = params.get('model', 1)
         
         if h <= 0:
             return 0
@@ -226,12 +264,12 @@ class SimpleGeostat:
         if r <= 0:
             return nugget + sill
         
-        if model == 'spherical':
+        if model == 1:
             if h < r:
                 return nugget + sill * (1.5 * h / r - 0.5 * (h / r) ** 3)
             else:
                 return nugget + sill
-        elif model == 'exponential':
+        elif model == 2:
             return nugget + sill * (1 - math.exp(-3 * h / r))
         else:
             if h < r:
@@ -239,7 +277,7 @@ class SimpleGeostat:
             else:
                 return nugget + sill
     
-    def cross_validate(self, power=2, k_folds=5):
+    def cross_validate(self, power: float = 2, k_folds: int = 5) -> float:
         if not self.data or k_folds <= 0:
             return 0
         
@@ -264,7 +302,7 @@ class SimpleGeostat:
         rmse = math.sqrt(sum(errors) / len(errors)) if errors else 0
         return rmse
     
-    def statistics_summary(self):
+    def statistics_summary(self) -> Dict[str, float]:
         if not self.data:
             return {}
         
@@ -277,37 +315,45 @@ class SimpleGeostat:
         y_coords = [y for _, y, _ in self.data]
         
         return {
-            'n_points': len(self.data),
+            'n_points': float(len(self.data)),
             'mean': mean_val,
             'variance': variance,
             'std_dev': std_dev,
             'min': min(values),
             'max': max(values),
-            'x_range': (min(x_coords), max(x_coords)),
-            'y_range': (min(y_coords), max(y_coords))
+            'x_range_min': min(x_coords),
+            'x_range_max': max(x_coords),
+            'y_range_min': min(y_coords),
+            'y_range_max': max(y_coords)
         }
     
-    def predict_grid_idw(self, xmin, xmax, ymin, ymax, resolution, power=2, max_points=None):
+    def predict_grid_idw(self, xmin: float, xmax: float, ymin: float, ymax: float, 
+                         resolution: int, power: float = 2, max_points: Optional[int] = None,
+                         verbose: bool = False) -> List[Tuple[Tuple[float, float], float]]:
         grid = self.create_grid(xmin, xmax, ymin, ymax, resolution)
         predictions = []
         
-        for x, y in grid:
+        total = len(grid)
+        for idx, (x, y) in enumerate(grid):
+            if verbose and idx % max(1, total // 10) == 0:
+                print(f"Progress: {idx}/{total}")
             pred = self.idw(x, y, power=power, max_points=max_points)
             predictions.append(((x, y), pred))
         
         return predictions
     
-    def predict_grid_block(self, xmin, xmax, ymin, ymax, resolution, block_size=10):
+    def predict_grid_block(self, xmin: float, xmax: float, ymin: float, ymax: float, 
+                          resolution: int, block_size: float = 10) -> List[Tuple[Tuple[float, float], float]]:
         grid = self.create_grid(xmin, xmax, ymin, ymax, resolution)
         block_averages = self.block_average(xmin, xmax, ymin, ymax, block_size)
         mean_value = self.statistics_summary().get('mean', 0)
         predictions = []
         
         for x, y in grid:
-            block_x = int((x - xmin) / block_size)
-            block_y = int((y - ymin) / block_size)
-            center_x = block_x * block_size + xmin + block_size / 2
-            center_y = block_y * block_size + ymin + block_size / 2
+            block_x = int((x - xmin) // block_size)
+            block_y = int((y - ymin) // block_size)
+            center_x = xmin + (block_x + 0.5) * block_size
+            center_y = ymin + (block_y + 0.5) * block_size
             pred = block_averages.get((center_x, center_y), mean_value)
             predictions.append(((x, y), pred))
         
@@ -323,7 +369,7 @@ if __name__ == "__main__":
         geo.data.append((x, y, val))
     
     stats = geo.statistics_summary()
-    print(f"Data points: {stats['n_points']}")
+    print(f"Data points: {stats['n_points']:.0f}")
     print(f"Mean value: {stats['mean']:.4f}")
     print(f"Standard deviation: {stats['std_dev']:.4f}")
     
