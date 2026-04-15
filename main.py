@@ -87,17 +87,10 @@ class SimpleGeostat:
         x_step = (xmax - xmin) / resolution
         y_step = (ymax - ymin) / resolution
         
-        eps = 1e-10
         for i in range(resolution + 1):
             for j in range(resolution + 1):
                 x = xmin + i * x_step
                 y = ymin + j * y_step
-                if x > xmax + eps or y > ymax + eps:
-                    continue
-                if x > xmax:
-                    x = xmax
-                if y > ymax:
-                    y = ymax
                 yield (x, y)
     
     def idw(self, target_x: float, target_y: float, power: float = 2, 
@@ -142,12 +135,12 @@ class SimpleGeostat:
             if not distances:
                 if data_source:
                     return sum(p.value for p in data_source) / len(data_source)
-                return 0
+                return 0.0
             
-            total_weight = 0
-            weighted_sum = 0
+            total_weight = 0.0
+            weighted_sum = 0.0
             for dist, val in distances:
-                weight = 1 / (dist ** power)
+                weight = 1.0 / (dist ** power)
                 total_weight += weight
                 weighted_sum += weight * val
             
@@ -171,12 +164,10 @@ class SimpleGeostat:
                 blocks[(block_x, block_y)].append(point.value)
         
         block_averages = {}
-        eps = 1e-10
         for (bx, by), values in blocks.items():
             center_x = xmin + (bx + 0.5) * block_size
             center_y = ymin + (by + 0.5) * block_size
-            if center_x <= xmax + eps and center_y <= ymax + eps:
-                block_averages[(center_x, center_y)] = sum(values) / len(values)
+            block_averages[(center_x, center_y)] = sum(values) / len(values)
         
         return block_averages
     
@@ -209,7 +200,7 @@ class SimpleGeostat:
     
     def _spherical_variogram(self, h: float, nugget: float, sill: float, range_param: float) -> float:
         if h <= 0:
-            return 0
+            return 0.0
         if range_param <= 0:
             return nugget + sill
         if h < range_param:
@@ -219,14 +210,14 @@ class SimpleGeostat:
     
     def _exponential_variogram(self, h: float, nugget: float, sill: float, range_param: float) -> float:
         if h <= 0:
-            return 0
+            return 0.0
         if range_param <= 0:
             return nugget + sill
         return nugget + sill * (1 - math.exp(-3 * h / range_param))
     
     def _gaussian_variogram(self, h: float, nugget: float, sill: float, range_param: float) -> float:
         if h <= 0:
-            return 0
+            return 0.0
         if range_param <= 0:
             return nugget + sill
         return nugget + sill * (1 - math.exp(-3 * (h / range_param) ** 2))
@@ -273,7 +264,7 @@ class SimpleGeostat:
                                maxfev=10000)
             nugget, sill, range_param = popt
             sill = max(sill, 0.01)
-            nugget = max(0, nugget)
+            nugget = max(0.0, nugget)
             range_param = max(0.1, range_param)
             return VariogramModel(nugget=nugget, sill=sill, range_param=range_param, model_type=model_type)
         except Exception:
@@ -314,22 +305,22 @@ class SimpleGeostat:
         for i in range(n_neighbors):
             for j in range(n_neighbors):
                 if i == j:
-                    gamma_matrix[i, j] = 0
+                    gamma_matrix[i, j] = 0.0
                 else:
                     h = np.hypot(neighbors[i, 0] - neighbors[j, 0], neighbors[i, 1] - neighbors[j, 1])
                     gamma_matrix[i, j] = self._variogram_value(h, variogram_model)
         
         A = np.zeros((n_neighbors + 1, n_neighbors + 1))
         A[:n_neighbors, :n_neighbors] = gamma_matrix
-        A[:n_neighbors, n_neighbors] = 1
-        A[n_neighbors, :n_neighbors] = 1
-        A[n_neighbors, n_neighbors] = 0
+        A[:n_neighbors, n_neighbors] = 1.0
+        A[n_neighbors, :n_neighbors] = 1.0
+        A[n_neighbors, n_neighbors] = 0.0
         
         b = np.zeros(n_neighbors + 1)
         for i in range(n_neighbors):
             h = distances[i]
             b[i] = self._variogram_value(h, variogram_model)
-        b[n_neighbors] = 1
+        b[n_neighbors] = 1.0
         
         try:
             weights = np.linalg.solve(A, b)
@@ -382,11 +373,12 @@ class SimpleGeostat:
                 error = (point.value - predicted) ** 2
                 errors.append(error)
         
-        rmse = math.sqrt(sum(errors) / len(errors)) if errors else 0
+        rmse = math.sqrt(sum(errors) / len(errors)) if errors else 0.0
         return rmse
     
     def cross_validate_kriging(self, variogram_model: VariogramModel, 
-                               k_folds: int = 5, max_points: int = 20) -> float:
+                               k_folds: int = 5, max_points: int = 20, 
+                               refit_variogram: bool = False) -> float:
         if len(self.data) < 2 or k_folds <= 0:
             return 0.0
         
@@ -413,12 +405,21 @@ class SimpleGeostat:
             temp_geo.data = deepcopy(train_set)
             temp_geo._build_spatial_index()
             
+            if refit_variogram:
+                lags, gamma = temp_geo.experimental_variogram(max_lag=50, n_bins=15)
+                if lags and gamma:
+                    current_model = temp_geo.fit_variogram_model(lags, gamma, model_type=variogram_model.model_type)
+                else:
+                    current_model = variogram_model
+            else:
+                current_model = variogram_model
+            
             for point in test_set:
-                predicted, _ = temp_geo.ordinary_kriging(point.x, point.y, variogram_model, max_points)
+                predicted, _ = temp_geo.ordinary_kriging(point.x, point.y, current_model, max_points)
                 error = (point.value - predicted) ** 2
                 errors.append(error)
         
-        rmse = math.sqrt(sum(errors) / len(errors)) if errors else 0
+        rmse = math.sqrt(sum(errors) / len(errors)) if errors else 0.0
         return rmse
     
     def statistics_summary(self) -> Dict[str, float]:
@@ -480,20 +481,24 @@ class SimpleGeostat:
                           resolution: int, block_size: float = 10) -> List[Tuple[Tuple[float, float], float]]:
         grid_points = list(self.create_grid(xmin, xmax, ymin, ymax, resolution))
         block_averages = self.block_average(xmin, xmax, ymin, ymax, block_size)
-        mean_value = self.statistics_summary().get('mean', 0)
-        predictions = []
+        mean_value = self.statistics_summary().get('mean', 0.0)
         
+        width = xmax - xmin
+        height = ymax - ymin
+        n_blocks_x = max(1, int(math.ceil(width / block_size)))
+        n_blocks_y = max(1, int(math.ceil(height / block_size)))
+        actual_block_size_x = width / n_blocks_x
+        actual_block_size_y = height / n_blocks_y
+        
+        predictions = []
         for x, y in grid_points:
-            if x < xmin or x > xmax or y < ymin or y > ymax:
-                continue
-            block_x = int((x - xmin) // block_size)
-            block_y = int((y - ymin) // block_size)
-            center_x = xmin + (block_x + 0.5) * block_size
-            center_y = ymin + (block_y + 0.5) * block_size
-            if center_x <= xmax + 1e-10 and center_y <= ymax + 1e-10:
-                pred = block_averages.get((center_x, center_y), mean_value)
-            else:
-                pred = mean_value
+            block_x = int((x - xmin) // actual_block_size_x)
+            block_y = int((y - ymin) // actual_block_size_y)
+            block_x = max(0, min(block_x, n_blocks_x - 1))
+            block_y = max(0, min(block_y, n_blocks_y - 1))
+            center_x = xmin + (block_x + 0.5) * actual_block_size_x
+            center_y = ymin + (block_y + 0.5) * actual_block_size_y
+            pred = block_averages.get((center_x, center_y), mean_value)
             predictions.append(((x, y), pred))
         
         return predictions
@@ -524,10 +529,12 @@ if __name__ == "__main__":
         print(f"Exponential model - Nugget: {exponential_model.nugget:.4f}, Sill: {exponential_model.sill:.4f}, Range: {exponential_model.range_param:.4f}")
         
         idw_rmse = geo.cross_validate_idw(power=2, k_folds=5)
-        kriging_rmse = geo.cross_validate_kriging(spherical_model, k_folds=5, max_points=20)
+        kriging_rmse_fixed = geo.cross_validate_kriging(spherical_model, k_folds=5, max_points=20, refit_variogram=False)
+        kriging_rmse_refit = geo.cross_validate_kriging(spherical_model, k_folds=5, max_points=20, refit_variogram=True)
         
         print(f"IDW Cross-validation RMSE: {idw_rmse:.4f}")
-        print(f"Kriging Cross-validation RMSE: {kriging_rmse:.4f}")
+        print(f"Kriging (fixed model) RMSE: {kriging_rmse_fixed:.4f}")
+        print(f"Kriging (refit model) RMSE: {kriging_rmse_refit:.4f}")
         
         grid_predictions_idw = geo.predict_grid_idw(0, 100, 0, 100, 20, power=2, max_points=10)
         geo.save_csv('predictions_idw.csv', grid_predictions_idw)
