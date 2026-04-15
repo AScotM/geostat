@@ -24,10 +24,14 @@ class VariogramModel:
 
 class SimpleGeostat:
     
-    def __init__(self):
+    def __init__(self, random_seed: Optional[int] = None):
         self.data: List[DataPoint] = []
         self.kdtree: Optional[cKDTree] = None
         self.data_array: Optional[np.ndarray] = None
+        self.random_seed = random_seed
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
     
     def load_csv(self, filename: str, x_col: int = 0, y_col: int = 1, 
                  val_col: int = 2, has_header: bool = True, reset: bool = False) -> None:
@@ -83,10 +87,17 @@ class SimpleGeostat:
         x_step = (xmax - xmin) / resolution
         y_step = (ymax - ymin) / resolution
         
+        eps = 1e-10
         for i in range(resolution + 1):
             for j in range(resolution + 1):
                 x = xmin + i * x_step
                 y = ymin + j * y_step
+                if x > xmax + eps or y > ymax + eps:
+                    continue
+                if x > xmax:
+                    x = xmax
+                if y > ymax:
+                    y = ymax
                 yield (x, y)
     
     def idw(self, target_x: float, target_y: float, power: float = 2, 
@@ -160,10 +171,12 @@ class SimpleGeostat:
                 blocks[(block_x, block_y)].append(point.value)
         
         block_averages = {}
+        eps = 1e-10
         for (bx, by), values in blocks.items():
             center_x = xmin + (bx + 0.5) * block_size
             center_y = ymin + (by + 0.5) * block_size
-            block_averages[(center_x, center_y)] = sum(values) / len(values)
+            if center_x <= xmax + eps and center_y <= ymax + eps:
+                block_averages[(center_x, center_y)] = sum(values) / len(values)
         
         return block_averages
     
@@ -226,34 +239,42 @@ class SimpleGeostat:
         lags_array = np.array(lags)
         gamma_array = np.array(gamma)
         
-        nugget_initial = gamma_array[0]
-        sill_initial = gamma_array[-1] - nugget_initial
-        if sill_initial <= 0:
+        nugget_initial = max(0.0, gamma_array[0])
+        sill_initial = max(0.01, gamma_array[-1] - nugget_initial)
+        
+        if sill_initial <= 1e-6:
             sill_initial = 1.0
         
-        range_initial = lags_array[-1] * 0.5
+        range_initial = max(0.1, lags_array[-1] * 0.5)
         
         if model_type == 'spherical':
             def model_func(h, nugget, sill, r):
-                result = np.zeros_like(h)
-                mask = h < r
-                result[mask] = nugget + sill * (1.5 * h[mask] / r - 0.5 * (h[mask] / r) ** 3)
+                result = np.zeros_like(h, dtype=np.float64)
+                r_safe = max(r, 1e-8)
+                mask = h < r_safe
+                result[mask] = nugget + sill * (1.5 * h[mask] / r_safe - 0.5 * (h[mask] / r_safe) ** 3)
                 result[~mask] = nugget + sill
                 return result
         elif model_type == 'exponential':
             def model_func(h, nugget, sill, r):
-                return nugget + sill * (1 - np.exp(-3 * h / r))
+                r_safe = max(r, 1e-8)
+                return nugget + sill * (1 - np.exp(-3 * h / r_safe))
         elif model_type == 'gaussian':
             def model_func(h, nugget, sill, r):
-                return nugget + sill * (1 - np.exp(-3 * (h / r) ** 2))
+                r_safe = max(r, 1e-8)
+                return nugget + sill * (1 - np.exp(-3 * (h / r_safe) ** 2))
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
         try:
             popt, _ = curve_fit(model_func, lags_array, gamma_array, 
                                p0=[nugget_initial, sill_initial, range_initial],
-                               bounds=([0, 0, 0.01], [np.inf, np.inf, np.inf]))
+                               bounds=([0, 0, 0.01], [np.inf, np.inf, np.inf]),
+                               maxfev=10000)
             nugget, sill, range_param = popt
+            sill = max(sill, 0.01)
+            nugget = max(0, nugget)
+            range_param = max(0.1, range_param)
             return VariogramModel(nugget=nugget, sill=sill, range_param=range_param, model_type=model_type)
         except Exception:
             return VariogramModel(nugget=nugget_initial, sill=sill_initial, 
@@ -274,14 +295,16 @@ class SimpleGeostat:
         if self.kdtree is None or self.data_array is None or len(self.data_array) == 0:
             return 0.0, variogram_model.nugget + variogram_model.sill
         
-        distances, indices = self.kdtree.query([target_x, target_y], k=min(max_points, len(self.data_array)))
+        n_total = len(self.data_array)
+        k = min(max_points, n_total)
+        distances, indices = self.kdtree.query([target_x, target_y], k=k)
         
         if np.isscalar(distances):
             distances = np.array([distances])
             indices = np.array([indices])
         
-        if np.any(distances == 0):
-            zero_idx = indices[distances == 0][0]
+        if np.any(distances < 1e-12):
+            zero_idx = indices[distances < 1e-12][0]
             return float(self.data_array[zero_idx, 2]), 0.0
         
         neighbors = self.data_array[indices]
@@ -312,27 +335,38 @@ class SimpleGeostat:
             weights = np.linalg.solve(A, b)
             kriging_weights = weights[:n_neighbors]
             lagrange_multiplier = weights[n_neighbors]
-            
             estimated_value = np.sum(kriging_weights * neighbors[:, 2])
             kriging_variance = np.sum(kriging_weights * b[:n_neighbors]) + lagrange_multiplier
-            
             return float(estimated_value), max(0.0, float(kriging_variance))
         except np.linalg.LinAlgError:
-            regularized_A = A + np.eye(A.shape[0]) * 1e-8
-            weights = np.linalg.solve(regularized_A, b)
-            kriging_weights = weights[:n_neighbors]
-            lagrange_multiplier = weights[n_neighbors]
-            estimated_value = np.sum(kriging_weights * neighbors[:, 2])
-            kriging_variance = np.sum(kriging_weights * b[:n_neighbors]) + lagrange_multiplier
-            return float(estimated_value), max(0.0, float(kriging_variance))
+            A_reg = A.copy()
+            A_reg[:n_neighbors, :n_neighbors] += np.eye(n_neighbors) * 1e-8
+            try:
+                weights = np.linalg.solve(A_reg, b)
+                kriging_weights = weights[:n_neighbors]
+                lagrange_multiplier = weights[n_neighbors]
+                estimated_value = np.sum(kriging_weights * neighbors[:, 2])
+                kriging_variance = np.sum(kriging_weights * b[:n_neighbors]) + lagrange_multiplier
+                return float(estimated_value), max(0.0, float(kriging_variance))
+            except np.linalg.LinAlgError:
+                weights = np.ones(n_neighbors) / n_neighbors
+                estimated_value = np.sum(weights * neighbors[:, 2])
+                kriging_variance = variogram_model.nugget + variogram_model.sill
+                return float(estimated_value), float(kriging_variance)
     
     def cross_validate_idw(self, power: float = 2, k_folds: int = 5) -> float:
         if len(self.data) < 2 or k_folds <= 0:
             return 0.0
         
         k_folds = min(k_folds, len(self.data))
-        shuffled_data = self.data[:]
-        random.shuffle(shuffled_data)
+        if self.random_seed is not None:
+            rng = random.Random(self.random_seed)
+            shuffled_data = self.data[:]
+            rng.shuffle(shuffled_data)
+        else:
+            shuffled_data = self.data[:]
+            random.shuffle(shuffled_data)
+        
         fold_size = max(1, len(shuffled_data) // k_folds)
         errors = []
         
@@ -357,8 +391,14 @@ class SimpleGeostat:
             return 0.0
         
         k_folds = min(k_folds, len(self.data))
-        shuffled_data = self.data[:]
-        random.shuffle(shuffled_data)
+        if self.random_seed is not None:
+            rng = random.Random(self.random_seed)
+            shuffled_data = self.data[:]
+            rng.shuffle(shuffled_data)
+        else:
+            shuffled_data = self.data[:]
+            random.shuffle(shuffled_data)
+        
         fold_size = max(1, len(shuffled_data) // k_folds)
         errors = []
         
@@ -369,7 +409,7 @@ class SimpleGeostat:
             test_set = shuffled_data[start:end]
             train_set = shuffled_data[:start] + shuffled_data[end:]
             
-            temp_geo = SimpleGeostat()
+            temp_geo = SimpleGeostat(random_seed=self.random_seed)
             temp_geo.data = deepcopy(train_set)
             temp_geo._build_spatial_index()
             
@@ -444,18 +484,23 @@ class SimpleGeostat:
         predictions = []
         
         for x, y in grid_points:
+            if x < xmin or x > xmax or y < ymin or y > ymax:
+                continue
             block_x = int((x - xmin) // block_size)
             block_y = int((y - ymin) // block_size)
             center_x = xmin + (block_x + 0.5) * block_size
             center_y = ymin + (block_y + 0.5) * block_size
-            pred = block_averages.get((center_x, center_y), mean_value)
+            if center_x <= xmax + 1e-10 and center_y <= ymax + 1e-10:
+                pred = block_averages.get((center_x, center_y), mean_value)
+            else:
+                pred = mean_value
             predictions.append(((x, y), pred))
         
         return predictions
 
 
 if __name__ == "__main__":
-    geo = SimpleGeostat()
+    geo = SimpleGeostat(random_seed=42)
     
     for i in range(200):
         x = random.uniform(0, 100)
