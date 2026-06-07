@@ -38,22 +38,27 @@ class SimpleGeostat:
         if reset:
             self.clear_data()
         
-        with open(filename, 'r', encoding='utf-8', newline='') as f:
-            reader = csv.reader(f)
-            if has_header:
-                try:
-                    next(reader)
-                except StopIteration:
-                    pass
-            
-            for row in reader:
-                try:
-                    x = float(row[x_col])
-                    y = float(row[y_col])
-                    val = float(row[val_col])
-                    self.data.append(DataPoint(x=x, y=y, value=val))
-                except (ValueError, IndexError):
-                    continue
+        try:
+            with open(filename, 'r', encoding='utf-8', newline='') as f:
+                reader = csv.reader(f)
+                if has_header:
+                    try:
+                        next(reader)
+                    except StopIteration:
+                        pass
+                
+                for row in reader:
+                    try:
+                        x = float(row[x_col])
+                        y = float(row[y_col])
+                        val = float(row[val_col])
+                        self.data.append(DataPoint(x=x, y=y, value=val))
+                    except (ValueError, IndexError):
+                        continue
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File {filename} not found")
+        except PermissionError:
+            raise PermissionError(f"Permission denied for file {filename}")
         
         self._build_spatial_index()
     
@@ -64,11 +69,14 @@ class SimpleGeostat:
             self.data_array = np.array([[p.x, p.y, p.value] for p in self.data])
     
     def save_csv(self, filename: str, predictions: List[Tuple[Tuple[float, float], float]]) -> None:
-        with open(filename, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['x', 'y', 'predicted'])
-            for (x, y), pred in predictions:
-                writer.writerow([x, y, pred])
+        try:
+            with open(filename, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['x', 'y', 'predicted'])
+                for (x, y), pred in predictions:
+                    writer.writerow([x, y, pred])
+        except PermissionError:
+            raise PermissionError(f"Permission denied for file {filename}")
     
     def clear_data(self) -> None:
         self.data = []
@@ -175,19 +183,26 @@ class SimpleGeostat:
         if max_lag <= 0 or n_bins <= 0 or len(self.data) < 2:
             return [], []
         
+        points_array = np.array([[p.x, p.y, p.value] for p in self.data])
+        coords = points_array[:, :2]
+        values = points_array[:, 2]
+        
+        tree = cKDTree(coords)
+        pairs = tree.query_pairs(r=max_lag)
+        
+        if not pairs:
+            return [], []
+        
         bin_width = max_lag / n_bins
         bins = [[] for _ in range(n_bins)]
         
-        n = len(self.data)
-        for i in range(n):
-            p1 = self.data[i]
-            for j in range(i + 1, n):
-                p2 = self.data[j]
-                dist = math.hypot(p1.x - p2.x, p1.y - p2.y)
-                if dist <= max_lag:
-                    semivar = 0.5 * (p1.value - p2.value) ** 2
-                    bin_idx = min(int(dist / bin_width), n_bins - 1)
-                    bins[bin_idx].append(semivar)
+        for i, j in pairs:
+            p1 = points_array[i]
+            p2 = points_array[j]
+            dist = math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+            semivar = 0.5 * (p1[2] - p2[2]) ** 2
+            bin_idx = min(int(dist / bin_width), n_bins - 1)
+            bins[bin_idx].append(semivar)
         
         lag_centers = []
         gamma = []
@@ -240,7 +255,7 @@ class SimpleGeostat:
         
         if model_type == 'spherical':
             def model_func(h, nugget, sill, r):
-                result = np.zeros_like(h, dtype=np.float64)
+                result = np.zeros_like(h)
                 r_safe = max(r, 1e-8)
                 mask = h < r_safe
                 result[mask] = nugget + sill * (1.5 * h[mask] / r_safe - 0.5 * (h[mask] / r_safe) ** 3)
@@ -406,7 +421,10 @@ class SimpleGeostat:
             temp_geo._build_spatial_index()
             
             if refit_variogram:
-                lags, gamma = temp_geo.experimental_variogram(max_lag=50, n_bins=15)
+                domain_size = max(temp_geo.statistics_summary().get('x_range_max', 100) - 
+                                temp_geo.statistics_summary().get('x_range_min', 0), 1)
+                max_lag = domain_size * 0.5
+                lags, gamma = temp_geo.experimental_variogram(max_lag=max_lag, n_bins=15)
                 if lags and gamma:
                     current_model = temp_geo.fit_variogram_model(lags, gamma, model_type=variogram_model.model_type)
                 else:
@@ -415,7 +433,9 @@ class SimpleGeostat:
                 current_model = variogram_model
             
             for point in test_set:
-                predicted, _ = temp_geo.ordinary_kriging(point.x, point.y, current_model, max_points)
+                predicted, _ = temp_geo.ordinary_kriging(
+                    point.x, point.y, current_model, max_points=max_points
+                )
                 error = (point.value - predicted) ** 2
                 errors.append(error)
         
@@ -498,11 +518,23 @@ class SimpleGeostat:
             block_y = max(0, min(block_y, n_blocks_y - 1))
             center_x = xmin + (block_x + 0.5) * actual_block_size_x
             center_y = ymin + (block_y + 0.5) * actual_block_size_y
-            pred = block_averages.get((center_x, center_y), mean_value)
+            
+            closest_key = None
+            min_dist = float('inf')
+            for (cx, cy), val in block_averages.items():
+                dist = (cx - center_x)**2 + (cy - center_y)**2
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_key = (cx, cy)
+            
+            if closest_key and min_dist < 1e-6:
+                pred = block_averages[closest_key]
+            else:
+                pred = mean_value
+            
             predictions.append(((x, y), pred))
         
         return predictions
-
 
 if __name__ == "__main__":
     geo = SimpleGeostat(random_seed=42)
